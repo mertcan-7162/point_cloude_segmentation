@@ -1,0 +1,11 @@
+pointcloud_limits:
+ x_min : -50.0 #m
+ x_max : 50.0 #m
+ y_min : 0.0 #m
+ y_max : 100.0 #m
+ 
+grid_resolution : 0.3 #m
+min_variance_threshold : 0.05
+point_number_threshold : 2
+height_threshold:
+ ground : 0.30 #m
