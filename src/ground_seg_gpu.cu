@@ -193,11 +193,24 @@ __global__ void largeGridKernel(
 
     sdata[tid] = local_sum;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    for (int s = blockDim.x >> 1; s > 32; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    float mean = sdata[0] / static_cast<float>(cnt);
+    
+    float val = (tid < 64) ? sdata[tid] : 0.0f;  
+    if (tid < 32) {
+        val += sdata[tid + 32];  // 64→32
+        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+        if (tid == 0) sdata[0] = val;
+    }
+    __syncthreads();
+
+    float mean = val / static_cast<float>(cnt);
 
     // Strided variance
     float local_var = 0.0f;
@@ -207,11 +220,23 @@ __global__ void largeGridKernel(
     }
     sdata[tid] = local_var;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    for (int s = blockDim.x >> 1; s > 32; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
-    float variance = sdata[0] / static_cast<float>(cnt);
+
+    val = (tid < 64) ? sdata[tid] : 0.0f;  
+    if (tid < 32) {
+        val += sdata[tid + 32];  // 64→32
+        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+        if (tid == 0) sdata[0] = val;
+    }
+    __syncthreads();
+    float variance = val / static_cast<float>(cnt);
 
     bool grid_ground = (variance < var_threshold);
 
