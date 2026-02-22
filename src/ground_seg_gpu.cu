@@ -193,14 +193,13 @@ __global__ void largeGridKernel(
 
     sdata[tid] = local_sum;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 32; s >>= 1) {
+    for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
     
-    float val = (tid < 64) ? sdata[tid] : 0.0f;  
+    float val = (tid < 32) ? sdata[tid] : 0.0f;  
     if (tid < 32) {
-        val += sdata[tid + 32];  // 64→32
         val += __shfl_down_sync(0xFFFFFFFF, val, 16);
         val += __shfl_down_sync(0xFFFFFFFF, val, 8);
         val += __shfl_down_sync(0xFFFFFFFF, val, 4);
@@ -210,7 +209,7 @@ __global__ void largeGridKernel(
     }
     __syncthreads();
 
-    float mean = val / static_cast<float>(cnt);
+    float mean = sdata[0] / static_cast<float>(cnt);
 
     // Strided variance
     float local_var = 0.0f;
@@ -220,14 +219,13 @@ __global__ void largeGridKernel(
     }
     sdata[tid] = local_var;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 32; s >>= 1) {
+    for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
         if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
     }
 
-    val = (tid < 64) ? sdata[tid] : 0.0f;  
+    val = (tid < 32) ? sdata[tid] : 0.0f;  
     if (tid < 32) {
-        val += sdata[tid + 32];  // 64→32
         val += __shfl_down_sync(0xFFFFFFFF, val, 16);
         val += __shfl_down_sync(0xFFFFFFFF, val, 8);
         val += __shfl_down_sync(0xFFFFFFFF, val, 4);
@@ -236,7 +234,7 @@ __global__ void largeGridKernel(
         if (tid == 0) sdata[0] = val;
     }
     __syncthreads();
-    float variance = val / static_cast<float>(cnt);
+    float variance = sdata[0] / static_cast<float>(cnt);
 
     bool grid_ground = (variance < var_threshold);
 
@@ -513,8 +511,11 @@ PipelineResult runGPUPipeline(const PointCloud& cloud, const Params& params) {
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
+    auto t_start_prep = std::chrono::high_resolution_clock::now();
     // ---- CPU prep: filter + group + build unified buffers ----
     UnifiedBuffers buf = buildUnifiedBuffers(cloud, params);
+    auto t_end_prep = std::chrono::high_resolution_clock::now();
+    printf("Prep time: %f ms\n", std::chrono::duration<double, std::milli>(t_end_prep - t_start_prep).count());
 
     // ---- Allocate persistent device arrays ----
     float *d_grid_mean_z, *d_grid_var_z;
@@ -600,7 +601,7 @@ PipelineResult runGPUPipeline(const PointCloud& cloud, const Params& params) {
         CUDA_CHECK(cudaMemcpy(d_lg_offsets, buf.large_data_offsets.data(),
                               buf.num_large * sizeof(int), cudaMemcpyHostToDevice));
 
-        const int lg_block = 512;
+        const int lg_block = 128;
         largeGridKernel<<<buf.num_large, lg_block, lg_block * sizeof(float)>>>(
             d_lg_z, d_lg_pidx, d_lg_gids, d_lg_counts, d_lg_offsets,
             d_grid_mean_z, d_grid_var_z, d_grid_is_ground, d_labels,
