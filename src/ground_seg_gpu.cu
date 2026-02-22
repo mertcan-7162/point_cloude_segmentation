@@ -160,6 +160,11 @@ __global__ void unifiedGridKernel(
     }
 }
 
+// Shared layout when cnt<=512: z_cache[0..511], reduce_buf[512..639]
+#define LG_Z_CACHE_MAX 512
+#define LG_REDUCE_OFF  512
+#define LG_SHMEM_FLOATS (LG_Z_CACHE_MAX + 128)
+
 // ============================================================================
 // Large Grid Kernel (65+ points): 1 block per grid, shared memory reduction
 // ============================================================================
@@ -186,55 +191,63 @@ __global__ void largeGridKernel(
     const int cnt = counts[gidx];
     const int off = offsets[gidx];
 
+    const bool use_cache = (cnt <= LG_Z_CACHE_MAX);
+    const float* z_read = use_cache ? sdata : (z_data + off);
+
+    if (use_cache) {
+        for (int i = tid; i < cnt; i += blockDim.x)
+            sdata[i] = z_data[off + i];
+        __syncthreads();
+    }
+
     // Strided sum
     float local_sum = 0.0f;
     for (int i = tid; i < cnt; i += blockDim.x)
-        local_sum += z_data[off + i];
+        local_sum += z_read[i];
 
-    sdata[tid] = local_sum;
+    float* rbuf = use_cache ? (sdata + LG_REDUCE_OFF) : sdata;
+    rbuf[tid] = local_sum;
     __syncthreads();
     for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+        if (tid < s) rbuf[tid] += rbuf[tid + s];
         __syncthreads();
     }
-    
-    float val = (tid < 32) ? sdata[tid] : 0.0f;  
+    float val = (tid < 32) ? rbuf[tid] : 0.0f;
     if (tid < 32) {
         val += __shfl_down_sync(0xFFFFFFFF, val, 16);
         val += __shfl_down_sync(0xFFFFFFFF, val, 8);
         val += __shfl_down_sync(0xFFFFFFFF, val, 4);
         val += __shfl_down_sync(0xFFFFFFFF, val, 2);
         val += __shfl_down_sync(0xFFFFFFFF, val, 1);
-        if (tid == 0) sdata[0] = val;
+        if (tid == 0) rbuf[0] = val;
     }
     __syncthreads();
 
-    float mean = sdata[0] / static_cast<float>(cnt);
+    float mean = rbuf[0] / static_cast<float>(cnt);
 
     // Strided variance
     float local_var = 0.0f;
     for (int i = tid; i < cnt; i += blockDim.x) {
-        float d = z_data[off + i] - mean;
+        float d = z_read[i] - mean;
         local_var += d * d;
     }
-    sdata[tid] = local_var;
+    rbuf[tid] = local_var;
     __syncthreads();
     for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
+        if (tid < s) rbuf[tid] += rbuf[tid + s];
         __syncthreads();
     }
-
-    val = (tid < 32) ? sdata[tid] : 0.0f;  
+    val = (tid < 32) ? rbuf[tid] : 0.0f;
     if (tid < 32) {
         val += __shfl_down_sync(0xFFFFFFFF, val, 16);
         val += __shfl_down_sync(0xFFFFFFFF, val, 8);
         val += __shfl_down_sync(0xFFFFFFFF, val, 4);
         val += __shfl_down_sync(0xFFFFFFFF, val, 2);
         val += __shfl_down_sync(0xFFFFFFFF, val, 1);
-        if (tid == 0) sdata[0] = val;
+        if (tid == 0) rbuf[0] = val;
     }
     __syncthreads();
-    float variance = sdata[0] / static_cast<float>(cnt);
+    float variance = rbuf[0] / static_cast<float>(cnt);
 
     bool grid_ground = (variance < var_threshold);
 
@@ -249,7 +262,7 @@ __global__ void largeGridKernel(
     for (int i = tid; i < cnt; i += blockDim.x) {
         int pidx = point_idx[off + i];
         if (pidx >= 0) {
-            bool pt_ground = grid_ground && (fabsf(z_data[off + i] - mean) < height_threshold);
+            bool pt_ground = grid_ground && (fabsf(z_read[i] - mean) < height_threshold);
             labels[pidx] = pt_ground ? 1 : 0;
         }
     }
@@ -473,19 +486,25 @@ static UnifiedBuffers buildUnifiedBuffers(
         buf.cum_blocks[gi] = total_blocks;
     }
 
-    // Large grids (65+)
+    // Large grids (65+): pad each grid to 32-aligned for coalesced access
     buf.num_large = static_cast<int>(large_grids.size());
     int large_running = 0;
     for (int g : large_grids) {
         auto& pts = grid_point_indices[g];
+        int cnt = static_cast<int>(pts.size());
+        int padded = ((cnt + 31) / 32) * 32;  // pad to multiple of 32
         buf.large_grid_ids.push_back(g);
-        buf.large_counts.push_back(static_cast<int>(pts.size()));
+        buf.large_counts.push_back(cnt);  // real count for mean/variance
         buf.large_data_offsets.push_back(large_running);
         for (int pidx : pts) {
             buf.large_z.push_back(cloud.z[pidx]);
             buf.large_pidx.push_back(pidx);
         }
-        large_running += static_cast<int>(pts.size());
+        for (int k = cnt; k < padded; k++) {
+            buf.large_z.push_back(0.0f);
+            buf.large_pidx.push_back(-1);
+        }
+        large_running += padded;
     }
 
     // Empty + 1-point grids
@@ -602,7 +621,7 @@ PipelineResult runGPUPipeline(const PointCloud& cloud, const Params& params) {
                               buf.num_large * sizeof(int), cudaMemcpyHostToDevice));
 
         const int lg_block = 128;
-        largeGridKernel<<<buf.num_large, lg_block, lg_block * sizeof(float)>>>(
+        largeGridKernel<<<buf.num_large, lg_block, LG_SHMEM_FLOATS * sizeof(float)>>>(
             d_lg_z, d_lg_pidx, d_lg_gids, d_lg_counts, d_lg_offsets,
             d_grid_mean_z, d_grid_var_z, d_grid_is_ground, d_labels,
             params.min_variance_threshold, params.height_threshold, buf.num_large);
