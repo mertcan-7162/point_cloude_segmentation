@@ -22,12 +22,13 @@
     } while (0)
 
 static constexpr int BLOCK_SIZE = 256;
-static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
-static constexpr int NUM_GROUPS = 6; // A-F in unified kernel
+static constexpr int NUM_GROUPS = 32;
+static constexpr int LARGE_GROUP = 31;
 
 // ============================================================================
-// Counting Sort Kernels: GPU-based preprocessing
+// Phase 1: Grid Assignment & Histogram with Row Assignment
 // ============================================================================
+
 __global__ void assignGridKernel(
     const float* __restrict__ x,
     const float* __restrict__ y,
@@ -47,821 +48,656 @@ __global__ void assignGridKernel(
     grid_idx[i] = row * num_cols + col;
 }
 
-__global__ void histogramKernel(
+__global__ void histogramWithRowKernel(
     const int* __restrict__ grid_idx,
-    int* __restrict__ grid_count,
+    int* grid_count,
+    int* __restrict__ point_row,
     int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int g = grid_idx[i];
-    if (g >= 0) atomicAdd(&grid_count[g], 1);
+    if (g >= 0)
+        point_row[i] = atomicAdd(&grid_count[g], 1);
+    else
+        point_row[i] = -1;
 }
 
-__global__ void scatterKernel(
-    const int* __restrict__ grid_idx,
+// ============================================================================
+// Phase 2: Group Assignment & Group Histogram
+// ============================================================================
+
+__global__ void groupAssignKernel(
+    const int* __restrict__ grid_count,
+    int* __restrict__ grid_group,
+    int point_threshold,
+    int NG)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= NG) return;
+    int cnt = grid_count[g];
+    if (cnt < point_threshold || cnt < 2)
+        grid_group[g] = -1;
+    else if (cnt <= 32)
+        grid_group[g] = cnt - 2;
+    else
+        grid_group[g] = LARGE_GROUP;
+}
+
+__global__ void groupHistogramWithRowKernel(
+    const int* __restrict__ grid_group,
+    int* group_grid_count,
+    int* __restrict__ grid_row_in_group,
+    int NG)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= NG) return;
+    int grp = grid_group[g];
+    if (grp >= 0)
+        grid_row_in_group[g] = atomicAdd(&group_grid_count[grp], 1);
+    else
+        grid_row_in_group[g] = -1;
+}
+
+// ============================================================================
+// Phase 3: z_data Construction
+// ============================================================================
+
+__global__ void fillLargeCountsKernel(
+    const int* __restrict__ grid_count,
+    const int* __restrict__ grid_group,
+    const int* __restrict__ grid_row_in_group,
+    int* __restrict__ large_counts,
+    int NG)
+{
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= NG) return;
+    if (grid_group[g] == LARGE_GROUP)
+        large_counts[grid_row_in_group[g]] = grid_count[g];
+}
+
+__global__ void scatterToZdataKernel(
     const float* __restrict__ z,
-    int* __restrict__ scatter_pos,
-    float* __restrict__ sorted_z,
-    int* __restrict__ sorted_pidx,
+    const int* __restrict__ grid_idx,
+    const int* __restrict__ grid_group,
+    const int* __restrict__ grid_row_in_group,
+    const int* __restrict__ point_row,
+    const int* __restrict__ group_data_offset,
+    const int* __restrict__ padded_sizes,
+    const int* __restrict__ large_offsets,
+    float* __restrict__ z_data,
     int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int g = grid_idx[i];
-    if (g >= 0) {
-        int pos = atomicAdd(&scatter_pos[g], 1);
-        sorted_z[pos] = z[i];
-        sorted_pidx[pos] = i;
-    }
+    if (g < 0) return;
+    int grp = grid_group[g];
+    if (grp < 0) return;
+
+    int pos;
+    if (grp < LARGE_GROUP)
+        pos = group_data_offset[grp] + grid_row_in_group[g] * padded_sizes[grp] + point_row[i];
+    else
+        pos = group_data_offset[LARGE_GROUP] + large_offsets[grid_row_in_group[g]] + point_row[i];
+
+    z_data[pos] = z[i];
 }
 
 // ============================================================================
-// Unified Kernel: Groups A-F
-//   Groups A-E: warp-level __shfl_xor butterfly reduction
-//   Group  F:   2 warps/grid, shared memory inter-warp reduction
+// Phase 4: Unified Reduction Kernel
+//   pad > 0 (2..32) : warp-level butterfly __shfl_xor reduction
+//   pad == 0         : large grid (>32 elems), shared-memory block reduction
 // ============================================================================
-__global__ void unifiedGridKernel(
+
+__global__ void reductionKernel(
     const float* __restrict__ z_data,
-    const int* __restrict__ point_idx,
-    const int* __restrict__ grid_ids,
-    const int* __restrict__ counts,
-    const int* __restrict__ cum_blocks,
-    const int* __restrict__ data_offsets,
-    const int* __restrict__ grid_offsets,
-    const int* __restrict__ count_offsets,
-    float* __restrict__ grid_mean_z,
-    float* __restrict__ grid_var_z,
-    uint8_t* __restrict__ grid_is_ground,
-    uint8_t* __restrict__ labels,
+    const int* __restrict__ block_z_offset,
+    const int* __restrict__ block_padded_size,
+    const int* __restrict__ block_actual_count,
+    const int* __restrict__ block_grid_output_offset,
+    float* __restrict__ grid_mean_z_buf,
+    float* __restrict__ grid_var_z_buf,
+    uint8_t* __restrict__ grid_is_ground_buf,
+    uint8_t* __restrict__ labels_buf,
     float var_threshold,
     float height_threshold)
 {
-    __shared__ float smem[8]; // used only by Group F (2 per grid × 4 grids/block)
+    extern __shared__ float sdata[];
 
-    const unsigned FULL_MASK = 0xFFFFFFFF;
-    const int lane = threadIdx.x & 31;
-    const int warp_in_block = threadIdx.x >> 5;
-
-    int group = -1;
-    for (int g = 0; g < NUM_GROUPS; g++) {
-        if (blockIdx.x < cum_blocks[g]) { group = g; break; }
-    }
-    if (group < 0) return;
-
-    const int block_in_group = blockIdx.x - (group > 0 ? cum_blocks[group - 1] : 0);
-    const int global_warp = block_in_group * WARPS_PER_BLOCK + warp_in_block;
-
-    const int d_off = data_offsets[group];
-    const int g_off = grid_offsets[group];
-    const int c_off = count_offsets[group];
+    const int bid = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int z_off = block_z_offset[bid];
+    const int z_end = block_z_offset[bid + 1];
+    const int pad   = block_padded_size[bid];
+    const int cnt   = block_actual_count[bid];
+    const int g_off = block_grid_output_offset[bid];
 
     // ----------------------------------------------------------------
-    // Groups A-E: generalized warp-level butterfly reduction
-    //   pad = 2 << group  →  A=2, B=4, C=8, D=16, E=32
-    //   grids_per_warp = 32 / pad
+    // Small groups (pad 2..32): butterfly warp-level reduction
     // ----------------------------------------------------------------
-    if (group <= 4) {
-        const int pad = 2 << group;
-        const int grids_per_warp = 32 / pad;
-        const int base_grid = global_warp * grids_per_warp;
-        const int warp_data_off = d_off + global_warp * 32;
-        const int local_grid = lane / pad;
-        const int lane_in_grid = lane & (pad - 1);
-        const int grid_abs = base_grid + local_grid;
+    if (pad > 0) {
+        const unsigned FULL_MASK = 0xFFFFFFFF;
+        const int total_data = z_end - z_off;
+        const int num_grids  = total_data / pad;
+        const int my_grid    = tid / pad;
+        const int lane_in_grid = tid & (pad - 1);
+        const bool valid     = (my_grid < num_grids);
 
-        float val = z_data[warp_data_off + lane];
-        int p_idx = point_idx[warp_data_off + lane];
-        int cnt = counts[c_off + grid_abs];
+        float val = valid ? z_data[z_off + tid] : 0.0f;
 
-        // Butterfly sum: after all steps, every lane in a pad-group has the full sum
         float sum = val;
         for (int step = 1; step < pad; step <<= 1)
             sum += __shfl_xor_sync(FULL_MASK, sum, step);
 
-        float mean = (cnt > 0) ? sum / static_cast<float>(cnt) : 0.0f;
+        float mean = (valid && cnt > 0) ? sum / static_cast<float>(cnt) : 0.0f;
 
-        // Variance: padded lanes (lane_in_grid >= cnt) contribute 0
-        float diff_sq = (lane_in_grid < cnt) ? (val - mean) * (val - mean) : 0.0f;
+        float diff_sq = (valid && lane_in_grid < cnt)
+                        ? (val - mean) * (val - mean) : 0.0f;
         float var_sum = diff_sq;
         for (int step = 1; step < pad; step <<= 1)
             var_sum += __shfl_xor_sync(FULL_MASK, var_sum, step);
-        float variance = (cnt > 0) ? var_sum / static_cast<float>(cnt) : 0.0f;
+        float variance = (valid && cnt > 0)
+                         ? var_sum / static_cast<float>(cnt) : 0.0f;
 
-        bool grid_ground = (variance < var_threshold);
-        bool pt_ground = grid_ground && (fabsf(val - mean) < height_threshold);
-
-        if (p_idx >= 0 && lane_in_grid < cnt)
-            labels[p_idx] = pt_ground ? 1 : 0;
-
-        if (lane_in_grid == 0 && cnt > 0) {
-            int gid = grid_ids[g_off + grid_abs];
-            grid_mean_z[gid] = mean;
-            grid_var_z[gid] = variance;
-            grid_is_ground[gid] = grid_ground ? 1 : 0;
+        if (valid) {
+            bool ground = (variance < var_threshold);
+            if (lane_in_grid < cnt) {
+                bool pt_ground = ground &&
+                                 (fabsf(val - mean) < height_threshold);
+                labels_buf[z_off + tid] = pt_ground ? 1 : 0;
+            }
+            if (lane_in_grid == 0) {
+                int out_idx = g_off + my_grid;
+                grid_mean_z_buf[out_idx] = mean;
+                grid_var_z_buf[out_idx]  = variance;
+                grid_is_ground_buf[out_idx] = ground ? 1 : 0;
+            }
         }
+        return;
     }
+
     // ----------------------------------------------------------------
-    // Group F: 33-64 elements, 2 warps per grid, 4 grids per block
+    // Large group (>32 elements): shared-memory block-level reduction
     // ----------------------------------------------------------------
-    else {
-        const int grid_in_block = warp_in_block >> 1;
-        const int warp_in_pair = warp_in_block & 1;
-        const int grid_abs = block_in_group * 4 + grid_in_block;
+    const int n = z_end - z_off;
 
-        int cnt = counts[c_off + grid_abs];
-        int element_idx = warp_in_pair * 32 + lane;
+    float local_sum = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x)
+        local_sum += z_data[z_off + i];
 
-        int data_base = d_off + grid_abs * 64 + element_idx;
-        float val = z_data[data_base];
-        int p_idx = point_idx[data_base];
-
-        // Warp-level partial sum via shfl_down
-        float warp_sum = val;
-        for (int offset = 16; offset >= 1; offset >>= 1)
-            warp_sum += __shfl_down_sync(FULL_MASK, warp_sum, offset);
-
-        if (lane == 0) smem[grid_in_block * 2 + warp_in_pair] = warp_sum;
+    sdata[tid] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
+    }
+    float v = (tid < 32) ? sdata[tid] : 0.0f;
+    if (tid < 32) {
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (tid == 0) sdata[0] = v;
+    }
+    __syncthreads();
+    float mean = sdata[0] / static_cast<float>(n);
 
-        float total_sum = smem[grid_in_block * 2] + smem[grid_in_block * 2 + 1];
-        float mean = (cnt > 0) ? total_sum / static_cast<float>(cnt) : 0.0f;
-
-        // Variance: guard padded elements
-        float diff_sq = (element_idx < cnt) ? (val - mean) * (val - mean) : 0.0f;
-        float warp_var = diff_sq;
-        for (int offset = 16; offset >= 1; offset >>= 1)
-            warp_var += __shfl_down_sync(FULL_MASK, warp_var, offset);
-
-        if (lane == 0) smem[grid_in_block * 2 + warp_in_pair] = warp_var;
+    float local_var = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float d = z_data[z_off + i] - mean;
+        local_var += d * d;
+    }
+    sdata[tid] = local_var;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
         __syncthreads();
+    }
+    v = (tid < 32) ? sdata[tid] : 0.0f;
+    if (tid < 32) {
+        v += __shfl_down_sync(0xFFFFFFFF, v, 16);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 8);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 4);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 2);
+        v += __shfl_down_sync(0xFFFFFFFF, v, 1);
+        if (tid == 0) sdata[0] = v;
+    }
+    __syncthreads();
+    float variance = sdata[0] / static_cast<float>(n);
+    bool ground = (variance < var_threshold);
 
-        float total_var = smem[grid_in_block * 2] + smem[grid_in_block * 2 + 1];
-        float variance = (cnt > 0) ? total_var / static_cast<float>(cnt) : 0.0f;
+    if (tid == 0) {
+        grid_mean_z_buf[g_off]      = mean;
+        grid_var_z_buf[g_off]       = variance;
+        grid_is_ground_buf[g_off]   = ground ? 1 : 0;
+    }
 
-        bool grid_ground = (variance < var_threshold);
-        bool pt_ground = grid_ground && (fabsf(val - mean) < height_threshold);
-
-        if (p_idx >= 0 && element_idx < cnt)
-            labels[p_idx] = pt_ground ? 1 : 0;
-
-        if (warp_in_pair == 0 && lane == 0 && cnt > 0) {
-            int gid = grid_ids[g_off + grid_abs];
-            grid_mean_z[gid] = mean;
-            grid_var_z[gid] = variance;
-            grid_is_ground[gid] = grid_ground ? 1 : 0;
-        }
+    for (int i = tid; i < n; i += blockDim.x) {
+        bool pt = ground && (fabsf(z_data[z_off + i] - mean) < height_threshold);
+        labels_buf[z_off + i] = pt ? 1 : 0;
     }
 }
 
-// Shared layout when cnt<=512: z_cache[0..511], reduce_buf[512..639]
-#define LG_Z_CACHE_MAX 512
-#define LG_REDUCE_OFF  512
-#define LG_SHMEM_FLOATS (LG_Z_CACHE_MAX + 128)
+// ============================================================================
+// Phase 5: Remap & Empty Grid Handling
+// ============================================================================
 
-// ============================================================================
-// Large Grid Kernel (65+ points): 1 block per grid, shared memory reduction
-// ============================================================================
-__global__ void largeGridKernel(
-    const float* __restrict__ z_data,
-    const int* __restrict__ point_idx,
-    const int* __restrict__ grid_ids,
-    const int* __restrict__ counts,
-    const int* __restrict__ offsets,
+__global__ void remapGridStatsKernel(
+    const int* __restrict__ grid_group,
+    const int* __restrict__ grid_row_in_group,
+    const int* __restrict__ group_grid_offset,
+    const float* __restrict__ grid_mean_z_buf,
+    const float* __restrict__ grid_var_z_buf,
+    const uint8_t* __restrict__ grid_is_ground_buf,
     float* __restrict__ grid_mean_z,
     float* __restrict__ grid_var_z,
     uint8_t* __restrict__ grid_is_ground,
-    uint8_t* __restrict__ labels,
-    float var_threshold,
-    float height_threshold,
-    int num_grids)
+    int NG)
 {
-    extern __shared__ float sdata[];
-
-    const int tid = threadIdx.x;
-    const int gidx = blockIdx.x;
-    if (gidx >= num_grids) return;
-
-    const int cnt = counts[gidx];
-    const int off = offsets[gidx];
-
-    const bool use_cache = (cnt <= LG_Z_CACHE_MAX);
-    const float* z_read = use_cache ? sdata : (z_data + off);
-
-    if (use_cache) {
-        for (int i = tid; i < cnt; i += blockDim.x)
-            sdata[i] = z_data[off + i];
-        __syncthreads();
-    }
-
-    // Strided sum
-    float local_sum = 0.0f;
-    for (int i = tid; i < cnt; i += blockDim.x)
-        local_sum += z_read[i];
-
-    float* rbuf = use_cache ? (sdata + LG_REDUCE_OFF) : sdata;
-    rbuf[tid] = local_sum;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
-        if (tid < s) rbuf[tid] += rbuf[tid + s];
-        __syncthreads();
-    }
-    float val = (tid < 32) ? rbuf[tid] : 0.0f;
-    if (tid < 32) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
-        if (tid == 0) rbuf[0] = val;
-    }
-    __syncthreads();
-
-    float mean = rbuf[0] / static_cast<float>(cnt);
-
-    // Strided variance
-    float local_var = 0.0f;
-    for (int i = tid; i < cnt; i += blockDim.x) {
-        float d = z_read[i] - mean;
-        local_var += d * d;
-    }
-    rbuf[tid] = local_var;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s >= 32; s >>= 1) {
-        if (tid < s) rbuf[tid] += rbuf[tid + s];
-        __syncthreads();
-    }
-    val = (tid < 32) ? rbuf[tid] : 0.0f;
-    if (tid < 32) {
-        val += __shfl_down_sync(0xFFFFFFFF, val, 16);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 8);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 4);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 2);
-        val += __shfl_down_sync(0xFFFFFFFF, val, 1);
-        if (tid == 0) rbuf[0] = val;
-    }
-    __syncthreads();
-    float variance = rbuf[0] / static_cast<float>(cnt);
-
-    bool grid_ground = (variance < var_threshold);
-
-    if (tid == 0) {
-        int gid = grid_ids[gidx];
-        grid_mean_z[gid] = mean;
-        grid_var_z[gid] = variance;
-        grid_is_ground[gid] = grid_ground ? 1 : 0;
-    }
-
-    // Inline per-point classification
-    for (int i = tid; i < cnt; i += blockDim.x) {
-        int pidx = point_idx[off + i];
-        if (pidx >= 0) {
-            bool pt_ground = grid_ground && (fabsf(z_read[i] - mean) < height_threshold);
-            labels[pidx] = pt_ground ? 1 : 0;
-        }
-    }
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= NG) return;
+    int grp = grid_group[g];
+    if (grp < 0) return;
+    int buf_pos = group_grid_offset[grp] + grid_row_in_group[g];
+    grid_mean_z[g]    = grid_mean_z_buf[buf_pos];
+    grid_var_z[g]     = grid_var_z_buf[buf_pos];
+    grid_is_ground[g] = grid_is_ground_buf[buf_pos];
 }
 
-// ============================================================================
-// Empty Grid Kernel: 3x3 neighbor average variance, reads grid_var_z from GPU
-// ============================================================================
 __global__ void emptyGridKernel(
-    const int* __restrict__ empty_indices,
+    const int* __restrict__ grid_group,
     const float* __restrict__ grid_var_z,
     uint8_t* __restrict__ grid_is_ground,
     float var_threshold,
-    int num_cols, int num_rows,
-    int num_empty)
+    int num_cols, int num_rows, int NG)
 {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_empty) return;
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= NG) return;
+    if (grid_group[g] >= 0) return;
 
-    int g = empty_indices[tid];
     int row = g / num_cols;
     int col = g % num_cols;
 
     float sum = 0.0f;
     int valid = 0;
-
     for (int dr = -1; dr <= 1; dr++) {
         for (int dc = -1; dc <= 1; dc++) {
-            int nr = row + dr;
-            int nc = col + dc;
+            int nr = row + dr, nc = col + dc;
             if (nr >= 0 && nr < num_rows && nc >= 0 && nc < num_cols) {
                 sum += grid_var_z[nr * num_cols + nc];
                 valid++;
             }
         }
     }
-
-    grid_is_ground[g] = (valid > 0 && sum / static_cast<float>(valid) < var_threshold) ? 1 : 0;
+    grid_is_ground[g] =
+        (valid > 0 && sum / static_cast<float>(valid) < var_threshold) ? 1 : 0;
 }
 
-// ============================================================================
-// CPU-side: unified buffer preparation
-// ============================================================================
-struct UnifiedBuffers {
-    std::vector<float> z_data;
-    std::vector<int> point_idx;
-    std::vector<int> grid_ids;
-    std::vector<int> counts;
-    int cum_blocks[NUM_GROUPS];
-    int data_offsets[NUM_GROUPS];
-    int grid_offsets[NUM_GROUPS];
-    int count_offsets[NUM_GROUPS];
-
-    std::vector<float> large_z;
-    std::vector<int> large_pidx;
-    std::vector<int> large_grid_ids;
-    std::vector<int> large_counts;
-    std::vector<int> large_data_offsets;
-    int num_large;
-
-    std::vector<int> empty_indices;
-    int num_empty;
-
-    std::vector<int> one_point_grids;
-    std::vector<int> one_point_pidx;
-};
-
-static UnifiedBuffers buildUnifiedBuffers(
-    const float* sorted_z,
-    const int* sorted_pidx,
-    const int* h_grid_count,
-    const int* h_grid_offset,
-    const Params& params)
+__global__ void remapLabelsKernel(
+    const float* __restrict__ z,
+    const int* __restrict__ grid_idx,
+    const int* __restrict__ grid_group,
+    const int* __restrict__ grid_count,
+    const int* __restrict__ grid_row_in_group,
+    const int* __restrict__ point_row,
+    const int* __restrict__ group_data_offset,
+    const int* __restrict__ padded_sizes,
+    const int* __restrict__ large_offsets,
+    const uint8_t* __restrict__ grid_is_ground,
+    const uint8_t* __restrict__ labels_buf,
+    uint8_t* __restrict__ labels,
+    float* grid_mean_z,
+    int N)
 {
-    const int NG = params.num_grids;
-    UnifiedBuffers buf;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    int g = grid_idx[i];
+    if (g < 0) { labels[i] = 0; return; }
 
-    const int pad_sizes[] = {2, 4, 8, 16, 32, 64};
-    std::vector<std::vector<int>> group_grids(NUM_GROUPS);
-    std::vector<int> large_grids;
-    std::vector<int> empty_grids;
-    std::vector<int> one_pt_grids;
-
-    for (int g = 0; g < NG; g++) {
-        int cnt = h_grid_count[g];
-        if (cnt < params.point_number_threshold) {
-            empty_grids.push_back(g);
-            if (cnt == 1) one_pt_grids.push_back(g);
-        }
-        else if (cnt <= 2)  group_grids[0].push_back(g);
-        else if (cnt <= 4)  group_grids[1].push_back(g);
-        else if (cnt <= 8)  group_grids[2].push_back(g);
-        else if (cnt <= 16) group_grids[3].push_back(g);
-        else if (cnt <= 32) group_grids[4].push_back(g);
-        else if (cnt <= 64) group_grids[5].push_back(g);
-        else                large_grids.push_back(g);
+    int grp = grid_group[g];
+    if (grp < 0) {
+        labels[i] = grid_is_ground[g] ? 1 : 0;
+        if (grid_count[g] == 1)
+            grid_mean_z[g] = z[i];
+        return;
     }
 
-    printf("  Groups: empty=%zu, A(2)=%zu, B(3-4)=%zu, C(5-8)=%zu, "
-           "D(9-16)=%zu, E(17-32)=%zu, F(33-64)=%zu, G(65+)=%zu\n",
-           empty_grids.size(),
-           group_grids[0].size(), group_grids[1].size(), group_grids[2].size(),
-           group_grids[3].size(), group_grids[4].size(), group_grids[5].size(),
-           large_grids.size());
+    int pos;
+    if (grp < LARGE_GROUP)
+        pos = group_data_offset[grp]
+            + grid_row_in_group[g] * padded_sizes[grp]
+            + point_row[i];
+    else
+        pos = group_data_offset[LARGE_GROUP]
+            + large_offsets[grid_row_in_group[g]]
+            + point_row[i];
 
-    // Pre-compute total sizes for reserve
-    size_t total_data_size = 0, total_meta_size = 0;
-    for (int gi = 0; gi < NUM_GROUPS; gi++) {
-        int ng = static_cast<int>(group_grids[gi].size());
-        if (gi < 5) {
-            int grids_per_warp = 32 / pad_sizes[gi];
-            int nw = (ng + grids_per_warp - 1) / grids_per_warp;
-            int blk = (nw + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-            int tw = blk * WARPS_PER_BLOCK;
-            total_data_size += tw * 32;
-            total_meta_size += tw * grids_per_warp;
-        } else {
-            int blk = (ng + 3) / 4;
-            total_data_size += blk * 4 * 64;
-            total_meta_size += blk * 4;
-        }
-    }
-    buf.z_data.reserve(total_data_size);
-    buf.point_idx.reserve(total_data_size);
-    buf.grid_ids.reserve(total_meta_size);
-    buf.counts.reserve(total_meta_size);
-
-    size_t total_large = 0;
-    for (int g : large_grids)
-        total_large += ((h_grid_count[g] + 31) / 32) * 32;
-    buf.large_z.reserve(total_large);
-    buf.large_pidx.reserve(total_large);
-    buf.large_grid_ids.reserve(large_grids.size());
-    buf.large_counts.reserve(large_grids.size());
-    buf.large_data_offsets.reserve(large_grids.size());
-
-    // Build unified z_data / point_idx / grid_ids / counts for groups A-F
-    int running_data = 0;
-    int running_grid = 0;
-    int running_count = 0;
-    int total_blocks = 0;
-
-    for (int gi = 0; gi < NUM_GROUPS; gi++) {
-        buf.data_offsets[gi] = running_data;
-        buf.grid_offsets[gi] = running_grid;
-        buf.count_offsets[gi] = running_count;
-
-        int pad = pad_sizes[gi];
-        int num_grids_in_group = static_cast<int>(group_grids[gi].size());
-
-        if (gi < 5) {
-            int grids_per_warp = 32 / pad;
-            int num_warps = (num_grids_in_group + grids_per_warp - 1) / grids_per_warp;
-            int blocks = (num_warps + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-            int total_warps = blocks * WARPS_PER_BLOCK;
-            int padded_grids = total_warps * grids_per_warp;
-
-            for (int w = 0; w < total_warps; w++) {
-                for (int g_in_warp = 0; g_in_warp < grids_per_warp; g_in_warp++) {
-                    int grid_local = w * grids_per_warp + g_in_warp;
-                    for (int elem = 0; elem < pad; elem++) {
-                        if (grid_local < num_grids_in_group) {
-                            int g = group_grids[gi][grid_local];
-                            int cnt = h_grid_count[g];
-                            int off = h_grid_offset[g];
-                            if (elem < cnt) {
-                                buf.z_data.push_back(sorted_z[off + elem]);
-                                buf.point_idx.push_back(sorted_pidx[off + elem]);
-                            } else {
-                                buf.z_data.push_back(0.0f);
-                                buf.point_idx.push_back(-1);
-                            }
-                        } else {
-                            buf.z_data.push_back(0.0f);
-                            buf.point_idx.push_back(-1);
-                        }
-                    }
-                }
-            }
-
-            for (int i = 0; i < padded_grids; i++) {
-                if (i < num_grids_in_group) {
-                    int g = group_grids[gi][i];
-                    buf.grid_ids.push_back(g);
-                    buf.counts.push_back(h_grid_count[g]);
-                } else {
-                    buf.grid_ids.push_back(0);
-                    buf.counts.push_back(0);
-                }
-            }
-
-            running_data += total_warps * 32;
-            running_grid += padded_grids;
-            running_count += padded_grids;
-            total_blocks += blocks;
-        } else {
-            int blocks = (num_grids_in_group + 3) / 4;
-            int padded_grids = blocks * 4;
-
-            for (int i = 0; i < padded_grids; i++) {
-                for (int elem = 0; elem < 64; elem++) {
-                    if (i < num_grids_in_group) {
-                        int g = group_grids[gi][i];
-                        int cnt = h_grid_count[g];
-                        int off = h_grid_offset[g];
-                        if (elem < cnt) {
-                            buf.z_data.push_back(sorted_z[off + elem]);
-                            buf.point_idx.push_back(sorted_pidx[off + elem]);
-                        } else {
-                            buf.z_data.push_back(0.0f);
-                            buf.point_idx.push_back(-1);
-                        }
-                    } else {
-                        buf.z_data.push_back(0.0f);
-                        buf.point_idx.push_back(-1);
-                    }
-                }
-            }
-
-            for (int i = 0; i < padded_grids; i++) {
-                if (i < num_grids_in_group) {
-                    int g = group_grids[gi][i];
-                    buf.grid_ids.push_back(g);
-                    buf.counts.push_back(h_grid_count[g]);
-                } else {
-                    buf.grid_ids.push_back(0);
-                    buf.counts.push_back(0);
-                }
-            }
-
-            running_data += padded_grids * 64;
-            running_grid += padded_grids;
-            running_count += padded_grids;
-            total_blocks += blocks;
-        }
-
-        buf.cum_blocks[gi] = total_blocks;
-    }
-
-    // Large grids (65+): pad each to 32-aligned
-    buf.num_large = static_cast<int>(large_grids.size());
-    int large_running = 0;
-    for (int g : large_grids) {
-        int cnt = h_grid_count[g];
-        int off = h_grid_offset[g];
-        int padded = ((cnt + 31) / 32) * 32;
-        buf.large_grid_ids.push_back(g);
-        buf.large_counts.push_back(cnt);
-        buf.large_data_offsets.push_back(large_running);
-        for (int k = 0; k < cnt; k++) {
-            buf.large_z.push_back(sorted_z[off + k]);
-            buf.large_pidx.push_back(sorted_pidx[off + k]);
-        }
-        for (int k = cnt; k < padded; k++) {
-            buf.large_z.push_back(0.0f);
-            buf.large_pidx.push_back(-1);
-        }
-        large_running += padded;
-    }
-
-    // Empty + 1-point grids
-    buf.empty_indices = empty_grids;
-    buf.num_empty = static_cast<int>(empty_grids.size());
-    buf.one_point_grids = one_pt_grids;
-    for (int g : one_pt_grids) {
-        int off = h_grid_offset[g];
-        buf.one_point_pidx.push_back(sorted_pidx[off]);
-    }
-
-    return buf;
+    labels[i] = labels_buf[pos];
 }
 
 // ============================================================================
-// Main GPU pipeline
+// Host helpers
 // ============================================================================
+
+static inline int nextPow2(int v) {
+    int p = 1;
+    while (p < v) p <<= 1;
+    return p;
+}
+
+// ============================================================================
+// Main GPU Pipeline
+// ============================================================================
+
 PipelineResult runGPUPipeline(const PointCloud& cloud, const Params& params) {
     PipelineResult result;
-    const int N = cloud.num_points;
+    const int N  = cloud.num_points;
     const int NG = params.num_grids;
 
-    cudaFree(0); // warmup
-
+    cudaFree(0);
     auto t_start = std::chrono::high_resolution_clock::now();
+    auto t_prev  = t_start;
+    auto lap = [&](const char* tag) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        auto now = std::chrono::high_resolution_clock::now();
+        printf("  [TIME] %-40s %7.3f ms\n", tag,
+               std::chrono::duration<double, std::milli>(now - t_prev).count());
+        t_prev = now;
+    };
 
-    // ---- GPU counting sort: filter + assign + histogram + scatter ----
-    auto t_sort_start = std::chrono::high_resolution_clock::now();
-
-    // Single allocation for counting sort buffers
-    // Float pool: [x|y|z] = 3*N, Int pool: [grid_idx|hist_count|prefix_offset] = N + 2*NG
-    size_t float_pool_size = 3 * N * sizeof(float);
-    size_t int_pool_size = (N + 2 * NG) * sizeof(int);
-    char *d_float_pool, *d_int_pool;
-    CUDA_CHECK(cudaMalloc(&d_float_pool, float_pool_size));
-    CUDA_CHECK(cudaMalloc(&d_int_pool, int_pool_size));
-
-    float* d_x          = reinterpret_cast<float*>(d_float_pool);
-    float* d_y          = d_x + N;
-    float* d_z          = d_y + N;
-
-    int* d_grid_idx      = reinterpret_cast<int*>(d_int_pool);
-    int* d_hist_count    = d_grid_idx + N;
-    int* d_prefix_offset = d_hist_count + NG;
-
+    // ---- Upload point cloud ------------------------------------------------
+    float *d_x, *d_y, *d_z;
+    CUDA_CHECK(cudaMalloc(&d_x, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_y, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_z, N * sizeof(float)));
     CUDA_CHECK(cudaMemcpy(d_x, cloud.x.data(), N * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_y, cloud.y.data(), N * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_z, cloud.z.data(), N * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(d_hist_count, 0, NG * sizeof(int)));
 
-    std::cout << "Assignning grids" << std::endl;
+    // ---- Allocate per-point & per-grid buffers -----------------------------
+    int *d_grid_idx, *d_point_row, *d_grid_count;
+    int *d_grid_group, *d_grid_row_in_group, *d_group_grid_count;
+    CUDA_CHECK(cudaMalloc(&d_grid_idx,          N  * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_point_row,         N  * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_grid_count,        NG * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_grid_group,        NG * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_grid_row_in_group, NG * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_group_grid_count,  NUM_GROUPS * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_grid_count,       0, NG * sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_group_grid_count, 0, NUM_GROUPS * sizeof(int)));
+    lap("H2D upload + initial alloc");
 
-    auto t_assign_start = std::chrono::high_resolution_clock::now();
-    int sort_blocks = (N + 255) / 256;
-    assignGridKernel<<<sort_blocks, 256>>>(
+    const int blocks_N  = (N  + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_NG = (NG + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // ---- Phase 1: assign grids ---------------------------------------------
+    assignGridKernel<<<blocks_N, BLOCK_SIZE>>>(
         d_x, d_y, d_grid_idx,
         params.x_min, params.x_max, params.y_min, params.y_max,
         params.grid_resolution, params.num_cols, params.num_rows, N);
     CUDA_CHECK(cudaGetLastError());
+    lap("assignGridKernel");
 
-    auto t_assign_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Assignning grids time: " << std::chrono::duration<double, std::milli>(t_assign_end - t_assign_start).count() << " ms" << std::endl;
+    cudaFree(d_x);
+    cudaFree(d_y);
 
-    std::cout << "Histogramming" << std::endl;
+    // ---- Phase 1: histogram + row assignment -------------------------------
+    histogramWithRowKernel<<<blocks_N, BLOCK_SIZE>>>(
+        d_grid_idx, d_grid_count, d_point_row, N);
+    CUDA_CHECK(cudaGetLastError());
+    lap("histogramWithRowKernel");
 
-    auto t_histogram_start = std::chrono::high_resolution_clock::now();
-    histogramKernel<<<sort_blocks, 256>>>(d_grid_idx, d_hist_count, N);
+    // ---- Phase 2: group assignment -----------------------------------------
+    groupAssignKernel<<<blocks_NG, BLOCK_SIZE>>>(
+        d_grid_count, d_grid_group, params.point_number_threshold, NG);
     CUDA_CHECK(cudaGetLastError());
 
-    auto t_histogram_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Histogramming time: " << std::chrono::duration<double, std::milli>(t_histogram_end - t_histogram_start).count() << " ms" << std::endl;
+    // ---- Phase 2: group histogram ------------------------------------------
+    groupHistogramWithRowKernel<<<blocks_NG, BLOCK_SIZE>>>(
+        d_grid_group, d_group_grid_count, d_grid_row_in_group, NG);
+    CUDA_CHECK(cudaGetLastError());
+    lap("groupAssign + groupHistogram");
 
-    std::cout << "Scanning" << std::endl;
+    // ---- Tiny D2H: 32 ints (128 bytes) ------------------------------------
+    int h_ggc[NUM_GROUPS];
+    CUDA_CHECK(cudaMemcpy(h_ggc, d_group_grid_count,
+                          NUM_GROUPS * sizeof(int), cudaMemcpyDeviceToHost));
 
-    auto t_scan_start = std::chrono::high_resolution_clock::now();
-    thrust::device_ptr<int> d_count_ptr(d_hist_count);
-    thrust::device_ptr<int> d_offset_ptr(d_prefix_offset);
-    thrust::exclusive_scan(d_count_ptr, d_count_ptr + NG, d_offset_ptr);
+    // ---- CPU: padded sizes & offsets ---------------------------------------
+    int h_pad[NUM_GROUPS];
+    for (int i = 0; i < LARGE_GROUP; i++)
+        h_pad[i] = nextPow2(i + 2);
+    h_pad[LARGE_GROUP] = 0;
 
-    auto t_scan_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Scanning time: " << std::chrono::duration<double, std::milli>(t_scan_end - t_scan_start).count() << " ms" << std::endl;
+    int h_gdo[NUM_GROUPS];
+    int run = 0;
+    for (int i = 0; i < LARGE_GROUP; i++) {
+        h_gdo[i] = run;
+        run += h_ggc[i] * h_pad[i];
+    }
+    h_gdo[LARGE_GROUP] = run;
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    int h_ggo[NUM_GROUPS];
+    int grun = 0;
+    for (int i = 0; i < NUM_GROUPS; i++) {
+        h_ggo[i] = grun;
+        grun += h_ggc[i];
+    }
+    int total_output_grids = grun;
 
-    // D2H: grid_idx, grid_count, grid_offset
-    std::vector<int> h_grid_idx(N);
-    std::vector<int> h_grid_count(NG), h_grid_offset(NG);
+    printf("  Groups: ");
+    for (int i = 0; i < NUM_GROUPS; i++)
+        if (h_ggc[i] > 0) printf("[cnt=%d]=%d ", (i < LARGE_GROUP ? i+2 : 33), h_ggc[i]);
+    printf("\n");
 
-    std::cout << "Copying grid_idx, grid_count, grid_offset to host" << std::endl;
+    // ---- Phase 3: large-group offsets (>32) --------------------------------
+    int num_large = h_ggc[LARGE_GROUP];
+    int total_large_data = 0;
+    int *d_large_counts = nullptr, *d_large_offsets = nullptr;
+    std::vector<int> h_large_off, h_large_cnt;
 
-    auto t_copy_start = std::chrono::high_resolution_clock::now();
-    CUDA_CHECK(cudaMemcpy(h_grid_idx.data(), d_grid_idx,
-                          N * sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_grid_count.data(), d_hist_count,
-                          NG * sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_grid_offset.data(), d_prefix_offset,
-                          NG * sizeof(int), cudaMemcpyDeviceToHost));
+    if (num_large > 0) {
+        CUDA_CHECK(cudaMalloc(&d_large_counts,  num_large * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_large_offsets, num_large * sizeof(int)));
 
-    auto t_copy_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Copying grid_idx, grid_count, grid_offset to host time: " << std::chrono::duration<double, std::milli>(t_copy_end - t_copy_start).count() << " ms" << std::endl;
+        fillLargeCountsKernel<<<blocks_NG, BLOCK_SIZE>>>(
+            d_grid_count, d_grid_group, d_grid_row_in_group,
+            d_large_counts, NG);
+        CUDA_CHECK(cudaGetLastError());
 
-    cudaFree(d_float_pool);
-    cudaFree(d_int_pool);
+        thrust::device_ptr<int> lc(d_large_counts);
+        thrust::device_ptr<int> lo(d_large_offsets);
+        thrust::exclusive_scan(lc, lc + num_large, lo);
 
-    // CPU scatter: deterministic (original point order preserved within each grid)
+        h_large_off.resize(num_large);
+        h_large_cnt.resize(num_large);
+        CUDA_CHECK(cudaMemcpy(h_large_off.data(), d_large_offsets,
+                              num_large * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_large_cnt.data(), d_large_counts,
+                              num_large * sizeof(int), cudaMemcpyDeviceToHost));
+        total_large_data = h_large_off[num_large - 1] + h_large_cnt[num_large - 1];
+    }
+    lap("large-group offsets (fill+scan+D2H)");
 
-    auto t_scatter_start = std::chrono::high_resolution_clock::now();
-    
-    int total_valid = h_grid_offset[NG - 1] + h_grid_count[NG - 1];
-    std::vector<float> h_sorted_z(total_valid);
-    std::vector<int> h_sorted_pidx(total_valid);
-    std::vector<int> scatter_pos(h_grid_offset.begin(), h_grid_offset.end());
-    for (int i = 0; i < N; i++) {
-        int g = h_grid_idx[i];
-        if (g >= 0) {
-            int pos = scatter_pos[g]++;
-            h_sorted_z[pos] = cloud.z[i];
-            h_sorted_pidx[pos] = i;
+    const int z_data_size = h_gdo[LARGE_GROUP] + total_large_data;
+
+    // ---- CPU: build block offset table -------------------------------------
+    std::vector<int> bzo, bps, bac, bgo;
+
+    for (int i = 0; i < LARGE_GROUP; i++) {
+        if (h_ggc[i] == 0) continue;
+        int pad = h_pad[i];
+        int act = i + 2;
+        int gpb = BLOCK_SIZE / pad;
+        int ng  = h_ggc[i];
+        int nb  = (ng + gpb - 1) / gpb;
+        for (int b = 0; b < nb; b++) {
+            int sg = b * gpb;
+            bzo.push_back(h_gdo[i] + sg * pad);
+            bps.push_back(pad);
+            bac.push_back(act);
+            bgo.push_back(h_ggo[i] + sg);
         }
     }
+    for (int b = 0; b < num_large; b++) {
+        bzo.push_back(h_gdo[LARGE_GROUP] + h_large_off[b]);
+        bps.push_back(0);
+        bac.push_back(h_large_cnt[b]);
+        bgo.push_back(h_ggo[LARGE_GROUP] + b);
+    }
+    bzo.push_back(z_data_size);
 
-    auto t_scatter_end = std::chrono::high_resolution_clock::now();
-    std::cout << "Scatter time: " << std::chrono::duration<double, std::milli>(t_scatter_end - t_scatter_start).count() << " ms" << std::endl;
+    const int total_blocks = static_cast<int>(bps.size());
 
+    // ---- Allocate z_data, labels_buf, intermediate output ------------------
+    float   *d_z_data = nullptr;
+    uint8_t *d_labels_buf = nullptr;
+    float   *d_gmz_buf = nullptr, *d_gvz_buf = nullptr;
+    uint8_t *d_gig_buf = nullptr;
 
-    // ---- CPU: build padded buffers from sorted data ----
-    auto t_buf_start = std::chrono::high_resolution_clock::now();
-    UnifiedBuffers buf = buildUnifiedBuffers(
-        h_sorted_z.data(), h_sorted_pidx.data(),
-        h_grid_count.data(), h_grid_offset.data(), params);
-    auto t_buf_end = std::chrono::high_resolution_clock::now();
-    printf("Buffer build time: %f ms\n",
-           std::chrono::duration<double, std::milli>(t_buf_end - t_buf_start).count());
-
-    // ---- Allocate persistent device arrays ----
-    float *d_grid_mean_z, *d_grid_var_z;
-    uint8_t *d_grid_is_ground, *d_labels;
-
-    CUDA_CHECK(cudaMalloc(&d_grid_mean_z, NG * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_grid_var_z, NG * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_grid_is_ground, NG * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_labels, N * sizeof(uint8_t)));
-
-    CUDA_CHECK(cudaMemset(d_grid_mean_z, 0, NG * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_grid_var_z, 0, NG * sizeof(float)));
-    CUDA_CHECK(cudaMemset(d_grid_is_ground, 0, NG * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMemset(d_labels, 0, N * sizeof(uint8_t)));
-
-    // ---- H2D: unified buffers ----
-    float *d_z_data = nullptr;
-    int *d_point_idx = nullptr, *d_grid_ids = nullptr, *d_counts = nullptr;
-    int *d_cum_blocks = nullptr, *d_data_offsets = nullptr;
-    int *d_grid_offsets = nullptr, *d_count_offsets = nullptr;
-
-    if (!buf.z_data.empty()) {
-        CUDA_CHECK(cudaMalloc(&d_z_data, buf.z_data.size() * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_point_idx, buf.point_idx.size() * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_grid_ids, buf.grid_ids.size() * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_counts, buf.counts.size() * sizeof(int)));
-
-        CUDA_CHECK(cudaMemcpy(d_z_data, buf.z_data.data(),
-                              buf.z_data.size() * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_point_idx, buf.point_idx.data(),
-                              buf.point_idx.size() * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_grid_ids, buf.grid_ids.data(),
-                              buf.grid_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_counts, buf.counts.data(),
-                              buf.counts.size() * sizeof(int), cudaMemcpyHostToDevice));
+    if (z_data_size > 0) {
+        CUDA_CHECK(cudaMalloc(&d_z_data,     z_data_size * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_z_data, 0,   z_data_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_labels_buf, z_data_size * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMemset(d_labels_buf, 0, z_data_size * sizeof(uint8_t)));
+    }
+    if (total_output_grids > 0) {
+        CUDA_CHECK(cudaMalloc(&d_gmz_buf, total_output_grids * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_gvz_buf, total_output_grids * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_gig_buf, total_output_grids * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMemset(d_gmz_buf, 0, total_output_grids * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_gvz_buf, 0, total_output_grids * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_gig_buf, 0, total_output_grids * sizeof(uint8_t)));
     }
 
-    CUDA_CHECK(cudaMalloc(&d_cum_blocks, NUM_GROUPS * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_data_offsets, NUM_GROUPS * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_grid_offsets, NUM_GROUPS * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_count_offsets, NUM_GROUPS * sizeof(int)));
+    // ---- Upload metadata arrays --------------------------------------------
+    int *d_gdo, *d_ps, *d_ggo;
+    CUDA_CHECK(cudaMalloc(&d_gdo, NUM_GROUPS * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_ps,  NUM_GROUPS * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_ggo, NUM_GROUPS * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_gdo, h_gdo, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ps,  h_pad, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ggo, h_ggo, NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMemcpy(d_cum_blocks, buf.cum_blocks,
-                          NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_data_offsets, buf.data_offsets,
-                          NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_grid_offsets, buf.grid_offsets,
-                          NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_count_offsets, buf.count_offsets,
-                          NUM_GROUPS * sizeof(int), cudaMemcpyHostToDevice));
-
-    // ---- Kernel 1: Unified (groups A-F) ----
-    int total_blocks = buf.cum_blocks[NUM_GROUPS - 1];
+    int *d_bzo = nullptr, *d_bps = nullptr, *d_bac = nullptr, *d_bgo = nullptr;
     if (total_blocks > 0) {
-        unifiedGridKernel<<<total_blocks, BLOCK_SIZE>>>(
-            d_z_data, d_point_idx, d_grid_ids, d_counts,
-            d_cum_blocks, d_data_offsets, d_grid_offsets, d_count_offsets,
-            d_grid_mean_z, d_grid_var_z, d_grid_is_ground, d_labels,
+        CUDA_CHECK(cudaMalloc(&d_bzo, (total_blocks + 1) * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bps, total_blocks * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bac, total_blocks * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bgo, total_blocks * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_bzo, bzo.data(), (total_blocks + 1) * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bps, bps.data(), total_blocks * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bac, bac.data(), total_blocks * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_bgo, bgo.data(), total_blocks * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    lap("CPU metadata + alloc bufs + H2D tables");
+
+    // ---- Phase 3: scatter z values into organized z_data -------------------
+    if (z_data_size > 0) {
+        scatterToZdataKernel<<<blocks_N, BLOCK_SIZE>>>(
+            d_z, d_grid_idx, d_grid_group, d_grid_row_in_group, d_point_row,
+            d_gdo, d_ps, d_large_offsets, d_z_data, N);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    lap("scatterToZdataKernel");
+
+    // ---- Phase 4: reduction ------------------------------------------------
+    if (total_blocks > 0) {
+        reductionKernel<<<total_blocks, BLOCK_SIZE,
+                          BLOCK_SIZE * sizeof(float)>>>(
+            d_z_data, d_bzo, d_bps, d_bac, d_bgo,
+            d_gmz_buf, d_gvz_buf, d_gig_buf, d_labels_buf,
             params.min_variance_threshold, params.height_threshold);
         CUDA_CHECK(cudaGetLastError());
     }
+    lap("reductionKernel");
 
-    // ---- Kernel 2: Large grids (65+) ----
-    if (buf.num_large > 0) {
-        float *d_lg_z = nullptr;
-        int *d_lg_pidx = nullptr, *d_lg_gids = nullptr;
-        int *d_lg_counts = nullptr, *d_lg_offsets = nullptr;
+    // ---- Phase 5: remap grid stats → real grid-indexed arrays --------------
+    float   *d_grid_mean_z, *d_grid_var_z;
+    uint8_t *d_grid_is_ground, *d_labels;
+    CUDA_CHECK(cudaMalloc(&d_grid_mean_z,    NG * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grid_var_z,     NG * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grid_is_ground, NG * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&d_labels,         N  * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemset(d_grid_mean_z,    0, NG * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_grid_var_z,     0, NG * sizeof(float)));
+    CUDA_CHECK(cudaMemset(d_grid_is_ground, 0, NG * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMemset(d_labels,         0, N  * sizeof(uint8_t)));
 
-        CUDA_CHECK(cudaMalloc(&d_lg_z, buf.large_z.size() * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_lg_pidx, buf.large_pidx.size() * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_lg_gids, buf.num_large * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_lg_counts, buf.num_large * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_lg_offsets, buf.num_large * sizeof(int)));
-
-        CUDA_CHECK(cudaMemcpy(d_lg_z, buf.large_z.data(),
-                              buf.large_z.size() * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_lg_pidx, buf.large_pidx.data(),
-                              buf.large_pidx.size() * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_lg_gids, buf.large_grid_ids.data(),
-                              buf.num_large * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_lg_counts, buf.large_counts.data(),
-                              buf.num_large * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_lg_offsets, buf.large_data_offsets.data(),
-                              buf.num_large * sizeof(int), cudaMemcpyHostToDevice));
-
-        const int lg_block = 128;
-        largeGridKernel<<<buf.num_large, lg_block, LG_SHMEM_FLOATS * sizeof(float)>>>(
-            d_lg_z, d_lg_pidx, d_lg_gids, d_lg_counts, d_lg_offsets,
-            d_grid_mean_z, d_grid_var_z, d_grid_is_ground, d_labels,
-            params.min_variance_threshold, params.height_threshold, buf.num_large);
+    if (total_output_grids > 0) {
+        remapGridStatsKernel<<<blocks_NG, BLOCK_SIZE>>>(
+            d_grid_group, d_grid_row_in_group, d_ggo,
+            d_gmz_buf, d_gvz_buf, d_gig_buf,
+            d_grid_mean_z, d_grid_var_z, d_grid_is_ground, NG);
         CUDA_CHECK(cudaGetLastError());
-
-        cudaFree(d_lg_z); cudaFree(d_lg_pidx); cudaFree(d_lg_gids);
-        cudaFree(d_lg_counts); cudaFree(d_lg_offsets);
     }
+    lap("alloc output + remapGridStatsKernel");
 
-    // ---- Kernel 3: Empty grids (reads grid_var_z already on GPU) ----
-    if (buf.num_empty > 0) {
-        int *d_empty_idx = nullptr;
-        CUDA_CHECK(cudaMalloc(&d_empty_idx, buf.num_empty * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(d_empty_idx, buf.empty_indices.data(),
-                              buf.num_empty * sizeof(int), cudaMemcpyHostToDevice));
+    // ---- Phase 5: empty-grid neighbour classification ----------------------
+    emptyGridKernel<<<blocks_NG, BLOCK_SIZE>>>(
+        d_grid_group, d_grid_var_z, d_grid_is_ground,
+        params.min_variance_threshold,
+        params.num_cols, params.num_rows, NG);
+    CUDA_CHECK(cudaGetLastError());
+    lap("emptyGridKernel");
 
-        int eblocks = (buf.num_empty + 255) / 256;
-        emptyGridKernel<<<eblocks, 256>>>(
-            d_empty_idx, d_grid_var_z, d_grid_is_ground,
-            params.min_variance_threshold,
-            params.num_cols, params.num_rows, buf.num_empty);
-        CUDA_CHECK(cudaGetLastError());
+    // ---- Phase 5: remap labels (+ set mean_z for 1-point grids) ------------
+    remapLabelsKernel<<<blocks_N, BLOCK_SIZE>>>(
+        d_z, d_grid_idx, d_grid_group, d_grid_count,
+        d_grid_row_in_group, d_point_row,
+        d_gdo, d_ps, d_large_offsets,
+        d_grid_is_ground, d_labels_buf,
+        d_labels, d_grid_mean_z, N);
+    CUDA_CHECK(cudaGetLastError());
+    lap("remapLabelsKernel");
 
-        cudaFree(d_empty_idx);
-    }
-
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // ---- D2H: results ----
-    result.labels.resize(N, 0);
+    // ---- D2H: final results ------------------------------------------------
+    result.labels.resize(N);
     result.grid_mean_z.resize(NG);
     result.grid_var_z.resize(NG);
     result.grid_is_ground.resize(NG);
+    result.grid_count.resize(NG);
 
-    CUDA_CHECK(cudaMemcpy(result.labels.data(), d_labels,
-                          N * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(result.grid_mean_z.data(), d_grid_mean_z,
-                          NG * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(result.grid_var_z.data(), d_grid_var_z,
-                          NG * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(result.labels.data(),         d_labels,
+                          N  * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(result.grid_mean_z.data(),    d_grid_mean_z,
+                          NG * sizeof(float),   cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(result.grid_var_z.data(),     d_grid_var_z,
+                          NG * sizeof(float),   cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(result.grid_is_ground.data(), d_grid_is_ground,
                           NG * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(result.grid_count.data(),     d_grid_count,
+                          NG * sizeof(int),     cudaMemcpyDeviceToHost));
+    lap("D2H final results");
 
-    // ---- CPU post-pass: classify 1-point grid points ----
-    for (size_t i = 0; i < buf.one_point_grids.size(); i++) {
-        int g = buf.one_point_grids[i];
-        int pidx = buf.one_point_pidx[i];
-        result.grid_mean_z[g] = cloud.z[pidx];
-        result.labels[pidx] = result.grid_is_ground[g] ? 1 : 0;
-    }
-
-    // ---- Cleanup ----
-    if (d_z_data) cudaFree(d_z_data);
-    if (d_point_idx) cudaFree(d_point_idx);
-    if (d_grid_ids) cudaFree(d_grid_ids);
-    if (d_counts) cudaFree(d_counts);
-    cudaFree(d_cum_blocks); cudaFree(d_data_offsets);
-    cudaFree(d_grid_offsets); cudaFree(d_count_offsets);
-    cudaFree(d_grid_mean_z); cudaFree(d_grid_var_z);
+    // ---- Cleanup -----------------------------------------------------------
+    cudaFree(d_z);
+    cudaFree(d_grid_idx);       cudaFree(d_point_row);
+    cudaFree(d_grid_count);     cudaFree(d_grid_group);
+    cudaFree(d_grid_row_in_group); cudaFree(d_group_grid_count);
+    if (d_large_counts)  cudaFree(d_large_counts);
+    if (d_large_offsets) cudaFree(d_large_offsets);
+    if (d_z_data)        cudaFree(d_z_data);
+    if (d_labels_buf)    cudaFree(d_labels_buf);
+    if (d_gmz_buf)       cudaFree(d_gmz_buf);
+    if (d_gvz_buf)       cudaFree(d_gvz_buf);
+    if (d_gig_buf)       cudaFree(d_gig_buf);
+    cudaFree(d_gdo);  cudaFree(d_ps);  cudaFree(d_ggo);
+    if (d_bzo) cudaFree(d_bzo);
+    if (d_bps) cudaFree(d_bps);
+    if (d_bac) cudaFree(d_bac);
+    if (d_bgo) cudaFree(d_bgo);
+    cudaFree(d_grid_mean_z);    cudaFree(d_grid_var_z);
     cudaFree(d_grid_is_ground); cudaFree(d_labels);
 
     auto t_end = std::chrono::high_resolution_clock::now();
-    result.elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    result.elapsed_ms =
+        std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
     result.grid_min_z.resize(NG, 0.0f);
     result.grid_max_z.resize(NG, 0.0f);
-    result.grid_count.resize(NG, 0);
 
     return result;
 }
