@@ -652,6 +652,7 @@ PipelineResult runGPUPipeline(const PointCloud& cloud, const Params& params) {
     cudaFree(d_grid_min_z);     cudaFree(d_grid_max_z);
     cudaFree(d_grid_is_ground); cudaFree(d_labels);
 
+    lap("cleanup");
     auto t_end = std::chrono::high_resolution_clock::now();
     result.elapsed_ms =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
