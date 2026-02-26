@@ -508,9 +508,9 @@ PipelineResult runGPUPipeline(const PointCloud& cloud, const Params& params) {
 
     const int z_data_size = h_gdo[LARGE_GROUP] + total_large_data;
 
-    // if (num_large > 0)
-    //     printf("  Large group: %d grids, %d points (no padding)\n",
-    //            num_large, total_large_data);
+    if (num_large > 0)
+        printf("  Large group: %d grids, %d points (no padding)\n",
+               num_large, total_large_data);
     // printf("  z_data total: %d floats (%.1f KB)\n",
     //        z_data_size, z_data_size * sizeof(float) / 1024.0);
 

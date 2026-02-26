@@ -1,0 +1,581 @@
+================================================================================
+        Point Cloud Ground Segmentation on GPU — Technical Report
+================================================================================
+
+  Kuartis — Computer Vision, Machine Learning and Robotics
+  Calibration, Localization and Mapping Team
+
+================================================================================
+1. MAIN APPROACH
+================================================================================
+
+The fundamental design principle driving this entire implementation was to
+utilize GPU resources as efficiently as possible. Every decision — from the
+data layout in memory to the choice of CUDA primitives in each kernel — was
+made with this goal in mind.
+
+1.1. The Key Observation: Grid Population Distribution
+------------------------------------------------------
+
+Before making any architectural decisions, we analyzed the input point cloud
+data (136,436 points projected onto a 334x334 = 111,556-cell grid with 0.3m
+resolution). The distribution of points across grid cells revealed a critical
+characteristic:
+
+  - Total grid cells:           111,556
+  - Empty cells (0 points):     95,509  (85.6%)
+  - Single-point cells:          3,801  ( 3.4%)   
+  - Active cells (>= 2 pts):   12,246  (11.0%)
+
+Among the 12,246 active cells:
+
+  - Cells with 2-32 points:    11,377  (92.9% of active cells)
+  - Cells with >32 points:        869  ( 7.1% of active cells)
+
+The detailed per-group breakdown for the 2-32 range:
+
+  Count=2 :  2,726 grids    |  Count=12:  152 grids    |  Count=22:  54 grids
+  Count=3 :  2,178 grids    |  Count=13:  125 grids    |  Count=23:  34 grids
+  Count=4 :  1,444 grids    |  Count=14:  173 grids    |  Count=24:  35 grids
+  Count=5 :  1,056 grids    |  Count=15:  115 grids    |  Count=25:  30 grids
+  Count=6 :    792 grids    |  Count=16:  164 grids    |  Count=26:  44 grids
+  Count=7 :    528 grids    |  Count=17:  118 grids    |  Count=27:  35 grids
+  Count=8 :    372 grids    |  Count=18:  149 grids    |  Count=28:  40 grids
+  Count=9 :    247 grids    |  Count=19:   79 grids    |  Count=29:  30 grids
+  Count=10:    221 grids    |  Count=20:   81 grids    |  Count=30:  52 grids
+  Count=11:    162 grids    |  Count=21:   63 grids    |  Count=31:  40 grids
+                            |                          |  Count=32:  38 grids
+                            |                          |  Count>32: 869 grids
+
+The maximum number of points in any single grid cell was 1,369.
+
+This distribution has a profound implication: the core computation of the
+algorithm — computing mean, variance, minimum, and maximum of Z values per
+grid cell — must be performed predominantly on very small sets (2 to 32
+elements). A naive approach of launching one thread block per grid cell would
+lead to severe hardware underutilization, since the vast majority of blocks
+would use only a handful of threads out of the available 256 or 1,024 threads
+in a block.
+
+1.2. Register-Level Computation via Warp-Level Primitives
+---------------------------------------------------------
+
+For grid cells with 2 to 32 points (92.9% of all active cells), we chose to
+avoid shared memory entirely and perform all reduction operations — sum (for
+mean), sum of squared differences (for variance), min, and max — purely at
+the register level using warp-level primitives (__shfl_xor_sync,
+__shfl_down_sync).
+
+In this approach, multiple small grid cells are packed side by side within a
+single warp of 32 threads. Each thread holds one Z value in its registers,
+and the butterfly shuffle pattern performs the reduction across the relevant
+lanes without any shared memory loads, stores, or synchronization barriers.
+This keeps the data in the fastest memory tier available on the GPU (registers)
+and eliminates shared memory bank conflicts entirely.
+
+To make this warp-level reduction work correctly, the input data must be
+organized so that each grid cell's Z values occupy consecutive lanes within a
+warp. Furthermore, the data must be padded to the next power of two so that
+the butterfly XOR shuffle pattern aligns correctly. This leads directly to
+our data layout and grouping strategy.
+
+1.3. Coalesced Memory Access via Grouping and Padding
+-----------------------------------------------------
+
+To enable the warp-level reduction described above, the Z data of all grid
+cells was reorganized into a contiguous buffer with the following structure:
+
+Grid cells are bucketed into 32 groups based on their point count:
+
+  - Group  0: cells with exactly  2 points  →  padded to  2 (next pow2)
+  - Group  1: cells with exactly  3 points  →  padded to  4
+  - Group  2: cells with exactly  4 points  →  padded to  4
+  - Group  3: cells with exactly  5 points  →  padded to  8
+  - Group  4: cells with exactly  6 points  →  padded to  8
+  - ...
+  - Group 29: cells with exactly 31 points  →  padded to 32
+  - Group 30: cells with exactly 32 points  →  padded to 32
+  - Group 31: cells with more than 32 points  →  no padding (block-level)
+
+Within each group (0-30), all grid cells have the same padded size. Their Z
+values are laid out consecutively in the buffer:
+
+  [ Grid_A: z0 z1 .. pad | Grid_B: z0 z1 .. pad | Grid_C: z0 z1 .. pad | ... ]
+
+Because all entries within a group share the same padded width, consecutive
+threads in a warp naturally read from consecutive memory addresses, achieving
+fully coalesced global memory access. Each warp reads its data segment in a
+single memory transaction (or minimal transactions), which is critical for
+GPU memory bandwidth utilization.
+
+The padding does introduce a memory overhead — each grid cell's data is
+rounded up to the next power of two — but given that the majority of cells
+are small (2-8 points), the absolute overhead is modest and is far outweighed
+by the computational efficiency gained from operating entirely in registers
+with coalesced access patterns.
+
+1.4. Block-Level Reduction for Large Grids
+------------------------------------------
+
+For grid cells with more than 32 points (7.1% of active cells, up to 1,369
+points), the data no longer fits in a single warp. These cells are assigned
+to the "large group" (Group 31), and each cell is processed by a dedicated
+thread block using classical shared-memory parallel reduction.
+
+Even in this block-level path, we maximize efficiency by employing warp-level
+primitives for the final stages of reduction. The shared memory tree reduction
+proceeds down to 32 elements, at which point the last warp completes the
+reduction using __shfl_down_sync — eliminating the need for __syncthreads()
+in the final iterations and reducing shared memory traffic.
+
+The shared memory layout for each block is organized as three contiguous
+regions (sum, min, max), each of size blockDim.x floats. The variance
+computation requires a second pass over the data (to compute squared
+differences from the mean), which is a deliberate trade-off: two-pass
+variance is numerically more stable than single-pass alternatives, and the
+data is already resident in L1/L2 cache from the first pass.
+
+1.5. 2D Tiled Ground Classification with Shared Memory Halo
+------------------------------------------------------------
+
+After computing per-grid statistics (mean, variance, min, max), the next step
+is determining whether each grid cell is ground or nonground. This decision
+uses a 3x3 patch neighborhood: if a cell has enough points, its own variance
+is checked against a threshold; if it is empty/sparse, the average variance of
+its 3x3 neighborhood is used instead.
+
+This 3x3 access pattern naturally maps to a 2D tiled kernel with a shared
+memory halo. We use 16x16 thread blocks that collectively load an 18x18 region
+(the tile plus a 1-cell border) into shared memory. Border and corner threads
+handle the halo loading. After a single __syncthreads(), each thread computes
+the 3x3 neighborhood average entirely from shared memory, avoiding redundant
+global memory reads.
+
+1.6. Final Point Classification
+-------------------------------
+
+The last kernel is a simple per-point classification: each thread reads the
+label of its grid cell (ground or nonground) and, if the grid is ground,
+compares the point's Z value against the grid's mean Z. This kernel is fully
+memory-bound and benefits from the coalesced SoA data layout.
+
+1.7. Summary of the Approach
+-----------------------------
+
+The design can be summarized in three key principles:
+
+  1. MATCH THE COMPUTATION GRANULARITY TO THE DATA:
+     Small grid cells (2-32 points, 92.9%) → warp-level register reductions.
+     Large grid cells (>32 points, 7.1%) → block-level shared memory reductions.
+
+  2. ORGANIZE DATA FOR COALESCED ACCESS:
+     Group-based Z data layout with power-of-two padding ensures that warps
+     read contiguous memory in single transactions.
+
+  3. MINIMIZE MEMORY HIERARCHY TRAFFIC:
+     Register-level reductions avoid shared memory entirely for the majority
+     of cells. Shared memory halos avoid redundant global memory reads for
+     2D neighborhood operations.
+
+These principles guided every kernel and data layout decision in the pipeline,
+from the initial grid assignment through to the final point classification.
+
+================================================================================
+2. GPU PIPELINE — DETAILED WALKTHROUGH
+================================================================================
+
+The GPU pipeline consists of 6 phases executed sequentially on the device. The
+overarching goal of phases 1-4 is to construct a carefully organized
+intermediate buffer (z_data) that enables the core reduction kernel (phase 5)
+to operate at maximum efficiency. After initial host-to-device transfer, the
+entire pipeline remains on the GPU until the final results are copied back —
+no intermediate CPU round-trips are needed for the main computation.
+
+The pipeline runs on an NVIDIA GeForce RTX 4050 Laptop GPU (Ada Lovelace,
+SM 8.9, 20 SMs, 6 GB VRAM). All kernels use a 1D thread block size of 256
+unless otherwise noted.
+
+------------------------------------------------------------------------
+Phase 1: Grid Assignment & Histogram  (assignAndHistogramKernel)
+------------------------------------------------------------------------
+
+  Kernel:   assignAndHistogramKernel
+  Grid:     534 blocks x 256 threads  (one thread per point, N=136,436)
+  Inputs:   d_x, d_y (point coordinates), spatial limits, resolution
+  Outputs:  grid_idx[N], grid_count[NG], point_row[N]
+
+This is a fused kernel that performs three operations in a single pass over
+all points:
+
+  1. GRID INDEX COMPUTATION: Each thread takes one point, checks whether it
+     falls within the X/Y bounds, and computes its 2D grid cell index as:
+       col = floor((x - x_min) / resolution)
+       row = floor((y - y_min) / resolution)
+       grid_idx = row * num_cols + col
+     Points outside the bounds receive grid_idx = -1.
+
+  2. PER-GRID HISTOGRAM: Each thread atomically increments grid_count[g]
+     using atomicAdd. This produces the number of points in each grid cell.
+
+  3. ROW ASSIGNMENT: The return value of atomicAdd gives each point a unique
+     row index within its grid cell (point_row[i]). This row index will be
+     used in later phases to determine exactly where each point's Z value
+     should be placed in the organized z_data buffer.
+
+By fusing these three operations, we avoid multiple passes over the 136K
+points. The atomic operations on grid_count introduce some contention, but
+since points are relatively spread across 12,246 active grid cells, the
+contention is low in practice.
+
+  Average runtime: ~0.46 ms
+
+  NOTE: This kernel's measured time is disproportionately high compared to
+  its actual workload. This is because it is the first kernel launched in the
+  pipeline — the CUDA runtime incurs a one-time initialization overhead on
+  the first kernel dispatch (driver-level setup, context finalization, etc.).
+  We verified this by completely emptying the kernel body (making it a no-op);
+  the measured time remained nearly identical (~0.45 ms). In a production
+  scenario where the pipeline is called repeatedly across frames, this
+  overhead would only occur on the very first invocation.
+
+------------------------------------------------------------------------
+Phase 2: Group Assignment  (groupAssignAndHistogramKernel)
+------------------------------------------------------------------------
+
+  Kernel:   groupAssignAndHistogramKernel
+  Grid:     436 blocks x 256 threads  (one thread per grid cell, NG=111,556)
+  Inputs:   grid_count[NG]
+  Outputs:  grid_group[NG], group_grid_count[32], grid_row_in_group[NG]
+
+This kernel has a similar fused structure to Phase 1, but operates at the
+grid level rather than the point level. Each thread processes one grid cell
+and performs two operations:
+
+  1. GROUP ASSIGNMENT: Based on the cell's point count, it is assigned to one
+     of 32 groups:
+       - count < 2    →  group = -1  (skipped, below threshold)
+       - count 2..32  →  group = count - 2  (groups 0 through 30)
+       - count > 32   →  group = 31  (large group)
+
+  2. ROW-IN-GROUP ASSIGNMENT: Using atomicAdd on group_grid_count[group], each
+     grid cell obtains its row position within its group. This tells us: "this
+     is the k-th grid cell in group g."
+
+The group_grid_count array (just 32 integers, 128 bytes) is then copied back
+to the host for the CPU-side offset calculations.
+
+  Average runtime: ~0.02 ms
+
+------------------------------------------------------------------------
+Phase 3: Large-Group Offset Computation
+------------------------------------------------------------------------
+
+  Kernel:   fillLargeCountsKernel
+  Library:  Thrust exclusive_scan
+
+For groups 0-30, all grid cells within a group have the same padded size, so
+computing memory offsets is trivial (group_offset + row * padded_size). However,
+Group 31 (large grids, >32 points) contains cells with varying point counts
+(33 to 1,369 points). To determine where each large cell's data begins in
+the buffer, we need a prefix sum over their individual counts.
+
+  1. fillLargeCountsKernel: Extracts the point count of each large grid cell
+     into a compact array (large_counts[869]).
+
+  2. Thrust exclusive_scan: Computes the cumulative prefix sum to produce
+     large_offsets[869], giving each large cell its starting position within
+     the large group's section of the buffer.
+
+The first three phases serve a single purpose: to establish the mapping from
+"input point i" to "position p in the organized z_data buffer." This mapping
+enables the core reduction kernel to read data in a perfectly organized layout.
+
+  Average runtime: ~0.12 ms
+
+------------------------------------------------------------------------
+Phase 4: Buffer Construction & Scatter  (scatterToZdataKernel)
+------------------------------------------------------------------------
+
+In this phase, the actual z_data buffer is allocated and populated. Before
+launching the scatter kernel, a small CPU-side computation determines how many
+thread blocks the reduction kernel will need and builds two metadata arrays:
+
+  - block_z_offset[total_blocks+1]: The start/end index in z_data for each
+    thread block.
+  - block_group_no[total_blocks]: Which group each thread block will process.
+
+The strategy is that each thread block contains data from only one group. This
+is essential because the reduction kernel selects its computation path (warp-
+level vs. block-level) based on the group number. Mixing groups within a block
+would cause warp divergence and incorrect results.
+
+For groups 0-30, multiple grid cells are packed into each block:
+  - Group 0  (pad=2):  128 grids per block  (256/2)
+  - Group 1  (pad=4):   64 grids per block  (256/4)
+  - Group 3  (pad=8):   32 grids per block  (256/8)
+  - Group 7  (pad=16):  16 grids per block  (256/16)
+  - Group 15 (pad=32):   8 grids per block  (256/32)
+
+For Group 31, each grid cell gets its own block (1 grid per block).
+
+This yields a total of 1,246 thread blocks for the reduction kernel.
+
+  Kernel:   scatterToZdataKernel
+  Grid:     534 blocks x 256 threads  (one thread per point, N=136,436)
+  Inputs:   d_z, grid_idx, grid_group, grid_row_in_group, point_row,
+            group_data_offset, padded_sizes, large_offsets
+  Outputs:  z_data[151,939], grid_id_data[151,939]
+
+Each thread reads one point's Z value and — using the grid_idx, grid_group,
+grid_row_in_group, and point_row computed in earlier phases — calculates
+exactly where in z_data this value belongs:
+
+  For small groups (0-30):
+    pos = group_offset[grp] + grid_row_in_group[g] * padded_size[grp] + point_row[i]
+
+  For large group (31):
+    pos = group_offset[31] + large_offsets[grid_row_in_group[g]] + point_row[i]
+
+Alongside z_data, a parallel array grid_id_data stores the original grid cell
+index for each entry, so the reduction kernel knows where to write its results.
+
+  Average runtime: ~0.2 ms
+
+------------------------------------------------------------------------
+Phase 5: Reduction — Mean, Variance, Min, Max  (reductionKernel)
+------------------------------------------------------------------------
+
+  Kernel:     reductionKernel
+  Grid:       1,246 blocks x 256 threads
+  Inputs:     z_data, grid_id_data, block_z_offset, block_group_no
+  Outputs:    grid_mean_z[NG], grid_var_z[NG], grid_min_z[NG], grid_max_z[NG]
+  Registers:  34 per thread  (0 bytes spill — fully register-resident)
+  Shared mem: dynamically allocated, 3 * 256 * 4 = 3,072 bytes (for large path)
+
+This is the most critical kernel in the pipeline. It reads from z_data —
+which is organized for fully coalesced access — and computes all four
+statistics (mean, variance, min, max) for every active grid cell.
+
+At kernel launch, each thread block reads its group number and data offset
+once from block_group_no and block_z_offset. The computation then diverges
+into one of two paths based on the group:
+
+  ┌─ Small-Group Path (groups 0-30, 377 blocks, 11,377 grids) ────────────┐
+  │                                                                        │
+  │  Multiple grid cells are packed into each warp. For example, in        │
+  │  Group 0 (pad=2), each warp of 32 threads processes 16 grid cells      │
+  │  simultaneously (32 / 2 = 16 cells per warp).                          │
+  │                                                                        │
+  │  All operations use warp-level shuffle primitives:                      │
+  │                                                                        │
+  │  1. SUM REDUCTION: __shfl_xor_sync with butterfly pattern              │
+  │       → divide by count → MEAN                                         │
+  │                                                                        │
+  │  2. Each thread computes (z - mean)^2 in registers                     │
+  │                                                                        │
+  │  3. SUM OF SQUARED DIFFS: __shfl_xor_sync butterfly                    │
+  │       → divide by count → VARIANCE                                     │
+  │                                                                        │
+  │  4. MIN/MAX: __shfl_xor_sync with fminf/fmaxf combiners               │
+  │                                                                        │
+  │  Zero shared memory is used. Zero __syncthreads() calls.               │
+  │  All data stays in registers throughout the entire computation.        │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ Large-Group Path (group 31, 869 blocks, 869 grids) ──────────────────┐
+  │                                                                        │
+  │  Each grid cell gets its own thread block (256 threads). If the grid   │
+  │  has more than 256 points, thread coarsening is applied: each thread   │
+  │  loops over its strided elements, accumulating a partial sum/min/max   │
+  │  in registers before writing to shared memory. This effectively        │
+  │  reduces the problem from N elements to 256 elements.                  │
+  │                                                                        │
+  │  Shared memory layout: [sum: 256 floats | min: 256 floats | max: 256] │
+  │  Total: 3,072 bytes per block.                                         │
+  │                                                                        │
+  │  1. PARALLEL REDUCTION in shared memory:                               │
+  │     Tree reduction (stride halving) from 256 down to 32 elements.      │
+  │     Each level requires a __syncthreads() barrier.                     │
+  │                                                                        │
+  │  2. FINAL WARP (32 elements → 1):                                      │
+  │     Once the active set drops to 32 threads (one warp), we switch      │
+  │     to __shfl_down_sync. This eliminates __syncthreads() for the       │
+  │     last 5 reduction steps and avoids shared memory read latency.      │
+  │                                                                        │
+  │  3. Thread 0 reads the final sum → divides by count → MEAN            │
+  │     All threads read MEAN from shared memory.                          │
+  │                                                                        │
+  │  4. SECOND PASS: each thread computes (z - mean)^2, accumulates.      │
+  │     Same shared memory tree + warp shuffle reduction → VARIANCE.       │
+  │     The second pass benefits from L1/L2 cache residency of z_data.    │
+  └────────────────────────────────────────────────────────────────────────┘
+
+REGISTER USAGE AND OCCUPANCY:
+
+  ptxas reports 34 registers per thread with 0 bytes of register spill.
+  This means the entire computation — including all intermediate values for
+  sum, min, max, variance, loop counters, and addresses — fits within the
+  register file without any spill to local memory.
+
+  With 256 threads per block and 34 registers per thread:
+    - Registers per block: 256 × 34 = 8,704
+    - SM register file: 65,536 registers (SM 8.9)
+    - Max blocks per SM (register-limited): 65,536 / 8,704 = 7
+    - Max blocks per SM (thread-limited): 1,536 / 256 = 6
+    - Effective limit: 6 blocks per SM
+    - Occupancy: 6 × 256 = 1,536 threads per SM = 100% occupancy
+
+  With 20 SMs on the RTX 4050, up to 120 blocks can be active concurrently.
+  The total of 1,246 blocks is processed in approximately 11 waves.
+
+OUTPUT WRITES:
+
+  After reduction, each grid cell's results (mean, variance, min, max) are
+  written to global arrays indexed by the original grid cell ID (real_gid,
+  obtained from grid_id_data). These writes are not coalesced — different
+  thread blocks write to scattered grid cell indices — but this is unavoidable:
+  the output must be indexed by grid cell ID for subsequent kernels to perform
+  O(1) lookups. Since this is a single write per grid cell (not a repeated
+  access pattern), the impact is minimal.
+
+PADDING TRADE-OFF:
+
+  The z_data buffer contains 151,939 float entries. The actual point data
+  (excluding empty/single-point grids) accounts for 134,256 - 2,180 (out of
+  bounds) - 3,801 (single-point) = ~130,455 active points. The padding overhead
+  is approximately 151,939 - 130,455 ≈ 21,484 entries (~14%), or about 84 KB
+  of additional GPU memory. This is a modest cost for the significant
+  computational benefits: fully coalesced reads, warp-level register-only
+  reductions, and simplified kernel logic without branching within warps.
+
+  Average runtime: ~0.055 ms
+
+------------------------------------------------------------------------
+Phase 6a: Ground Classification  (groundClassificationKernel)
+------------------------------------------------------------------------
+
+  Kernel:   groundClassificationKernel
+  Grid:     2D — (21 x 21) blocks of (16 x 16) threads
+  Inputs:   grid_var_z[NG], grid_count[NG]
+  Outputs:  is_grid_ground[NG]
+  Registers: 26 per thread
+  Shared mem: 2 x (16+2) x (16+2) x 4 = 2,592 bytes (variance + count tiles)
+
+This kernel determines whether each grid cell is ground or nonground, using
+a 3x3 patch-based decision. It uses a 2D thread block structure with shared
+memory halo loading — a classic GPU pattern for stencil-like operations.
+
+Each 16x16 thread block is responsible for classifying 256 grid cells in a
+tile. To evaluate the 3x3 neighborhood, the block needs access to a 1-cell
+border around the tile. The loading proceeds as follows:
+
+  1. Every thread loads its own cell's variance and count into shared memory
+     position [ty+1][tx+1].
+
+  2. Border threads (tx=0, tx=15, ty=0, ty=15) additionally load the
+     neighboring cells into the halo positions [ty+1][0], [ty+1][17], etc.
+
+  3. Corner threads load the four diagonal halo cells.
+
+  4. After __syncthreads(), all 9 neighbors of every cell are available in
+     shared memory.
+
+The classification logic:
+  - If the cell has >= point_threshold points: ground if variance < threshold.
+  - If the cell has < point_threshold points (empty/sparse): compute the
+    average variance across all valid cells in the 3x3 patch. Ground if this
+    average is below the threshold.
+
+Without shared memory, each cell would require up to 9 global memory reads
+for its neighborhood. With the tiled approach, each cell's data is read from
+global memory exactly once, and all neighborhood lookups hit shared memory.
+
+  Average runtime: ~0.022 ms
+
+------------------------------------------------------------------------
+Phase 6b: Point Classification  (pointClassificationKernel)
+------------------------------------------------------------------------
+
+  Kernel:   pointClassificationKernel
+  Grid:     534 blocks x 256 threads  (one thread per point)
+  Inputs:   d_z, grid_idx, grid_count, is_grid_ground, grid_mean_z
+  Outputs:  labels[N]
+  Registers: 12 per thread
+
+The final kernel assigns a ground (1) or nonground (0) label to each original
+3D point:
+
+  - If the point is out of bounds (grid_idx = -1): nonground.
+  - If the point's grid cell is classified as nonground: nonground.
+  - If the grid cell has < 2 points (empty cell marked as ground): ground
+    (benefit of the doubt).
+  - Otherwise: ground if |z - grid_mean_z| < height_threshold.
+
+This kernel is lightweight and fully memory-bound. The SoA data layout ensures
+coalesced reads for z values and labels.
+
+  Average runtime: ~0.015 ms
+
+------------------------------------------------------------------------
+Device-to-Host Transfer
+------------------------------------------------------------------------
+
+After all kernels complete, the final results (labels, grid statistics) are
+copied back to the host. This transfer dominates the total pipeline time:
+
+  D2H transfer: ~1.52 ms  (approximately 50% of total GPU pipeline time)
+
+This highlights a fundamental characteristic of GPU computing: the PCIe bus
+is often the bottleneck. The actual GPU computation (all 6 kernel phases
+combined) takes approximately 0.6 ms, but the round-trip data transfer
+(H2D + D2H) adds approximately 1.9 ms. In a production system where the
+pipeline is called repeatedly (e.g., streaming LiDAR frames), the H2D/D2H
+overhead could be amortized via double-buffering or pinned memory with async
+transfers.
+
+================================================================================
+3. TIMING SUMMARY
+================================================================================
+
+  Test platform: NVIDIA GeForce RTX 4050 Laptop GPU (SM 8.9, 20 SMs, 6 GB)
+  Input data:    136,436 points → 111,556 grid cells (12,246 active)
+
+  ┌──────────────────────────────────────────┬────────────┬───────────┐
+  │ Phase                                    │ Avg. Time  │ % of GPU  │
+  ├──────────────────────────────────────────┼────────────┼───────────┤
+  │ H2D upload + initial alloc               │   0.42 ms  │   13.8%   │
+  │ assignAndHistogramKernel                 │   0.46 ms  │   15.1%   │
+  │ groupAssignAndHistogramKernel            │   0.02 ms  │    0.7%   │
+  │ CPU: padded sizes & offsets              │   0.02 ms  │    0.6%   │
+  │ large-group offsets (scan+D2H)           │   0.12 ms  │    3.9%   │
+  │ CPU metadata + alloc bufs + H2D tables   │   0.20 ms  │    6.6%   │
+  │ scatterToZdataKernel                     │   0.03 ms  │    1.0%   │
+  │ reductionKernel                          │   0.06 ms  │    2.0%   │
+  │ groundClassificationKernel               │   0.02 ms  │    0.7%   │
+  │ pointClassificationKernel                │   0.01 ms  │    0.3%   │
+  │ D2H final results                        │   1.52 ms  │   50.0%   │
+  │ cleanup (cudaFree)                       │   0.16 ms  │    5.3%   │
+  ├──────────────────────────────────────────┼────────────┼───────────┤
+  │ TOTAL GPU pipeline                       │   3.04 ms  │  100.0%   │
+  │ TOTAL CPU pipeline                       │  ~22.0 ms  │     —     │
+  │ Speedup (CPU / GPU)                      │   ~7.2x    │     —     │
+  │ CPU vs GPU label agreement               │  136,436 / 136,436 (100%)  │
+  └──────────────────────────────────────────┴────────────┴───────────┘
+
+Key observations:
+
+  - Data transfer (H2D + D2H) accounts for ~64% of the total GPU time.
+    The actual GPU computation is only ~0.6 ms.
+
+  - The reductionKernel, despite being the most algorithmically complex
+    kernel, takes only 0.06 ms — a testament to the efficiency of the
+    group-based warp/block reduction strategy.
+
+  - CPU and GPU produce identical results (100% agreement on all 136,436
+    points), confirming the correctness of the GPU implementation.
+
+  - The GPU achieves approximately 7x speedup over the CPU implementation,
+    with the potential for much higher speedup if data transfer is excluded
+    or amortized (computation-only speedup: ~37x).
+
+================================================================================
